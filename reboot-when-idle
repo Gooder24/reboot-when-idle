@@ -263,12 +263,17 @@ age() { ((${1} < 3600)) && echo "$(($1 / 60)) min" || echo "$(($1 / 3600)) h"; }
 session_work() {  # session_work young|old: what people and agents run in login sessions, as "name (pid, age)"
   # Every process started over SSH, in a terminal or by an agent (also detached with nohup, setsid or &)
   # stays in its login session's cgroup. Not work there: shells, the agents themselves and whatever runs
-  # them (T3 Code's server and what it starts with itself), an agent's own helpers, this script.
+  # them (T3 Code's server and what it starts with itself), an agent's own helpers, this script and what reads
+  # its output through a pipe (reboot-when-idle status | grep).
   local -A parent since name above
-  local pid p a c cg list=() limit=$((AGENT_COMMAND_HOURS * 3600))
+  local pid p a c cg list=() limit=$((AGENT_COMMAND_HOURS * 3600)) pipes=' ' out
   while read -r pid p a c; do
     parent[$pid]=$p since[$pid]=$a name[$pid]=$c
   done < <(ps -e -o pid=,ppid=,etimes=,comm= 2> /dev/null)
+  for ((p = $$; p > 1 && ${#parent[$p]}; p = ${parent[$p]})); do  # this script, and the sudo that runs it
+    ((p == $$)) || [[ ${name[$p]} == sudo ]] || break
+    out=$(readlink "/proc/$p/fd/1" 2> /dev/null) && [[ $out == pipe:* ]] && pipes+="$out "
+  done
   for cg in $SESSION_CGROUPS; do
     [[ ! -r $cg/cgroup.procs ]] || list+=($(< "$cg/cgroup.procs"))
   done
@@ -286,6 +291,9 @@ session_work() {  # session_work young|old: what people and agents run in login 
     fi
     for ((p = pid; p > 1 && p != $$ && ${#parent[$p]}; p = ${parent[$p]})); do :; done
     ((p != $$)) || continue
+    if [[ $pipes != ' ' ]]; then
+      out=$(readlink "/proc/$pid/fd/0" 2> /dev/null) && [[ $pipes == *" $out "* ]] && continue
+    fi
     if { [[ $1 == young ]] && ((${since[$pid]} < limit)); } || { [[ $1 == old ]] && ((${since[$pid]} >= limit)); }; then
       echo "${name[$pid]} (pid $pid, $(age "${since[$pid]}"))"
     fi

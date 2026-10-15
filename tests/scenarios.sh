@@ -379,6 +379,10 @@ time.sleep(30)'" &
   check 'a detached command counts' grep -q "sleep (pid $detached," <<< "$work"
   check 'a helper the agent started at once does not' grep -vq "pid $helper," <<< "$work"
   check 'the agent and shells do not' grep -vqE "pid ($agent|$shell)," <<< "$work"
+  # from a shell of its own: what this script starts counts as the fake agent's helper
+  REBOOT_WHEN_IDLE_CONF=$T/conf bash -c '{ sleep 0.3; "$0" status; } | { echo "$BASHPID" >> "$1"; exec cat; }' \
+    "$tool" "$scope" > "$T/piped"
+  check 'what reads the status through a pipe does not (status | grep)' hasnt "$T/piped" 'cat (pid'
   set_conf AGENT_COMMAND_HOURS=0
   rwi status > "$T/status" 2>&1
   check 'older than AGENT_COMMAND_HOURS it is a server' has "$T/status" 'not counted, running longer'
