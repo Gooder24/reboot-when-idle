@@ -1,0 +1,17 @@
+# After every boot. Keeps a kernel started on trial if the network comes up with it, else goes back to the
+# kernel that worked. With no trial under way it only checks that GRUB starts a kernel that exists.
+# Not ordered before multi-user.target, so a slow network does not hold up the boot.
+[Unit]
+Description=Keep a newly started kernel if the network comes up with it, else go back
+DefaultDependencies=no
+After=sysinit.target basic.target network.target reboot-when-idle-boot.service
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/reboot-when-idle boot check
+TimeoutStartSec=40min
+
+[Install]
+WantedBy=multi-user.target

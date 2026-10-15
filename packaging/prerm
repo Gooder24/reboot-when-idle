@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stops the timer and the boot checks before the files go.
+set -e
+case ${1:-remove} in remove | deconfigure) ;; *) exit 0 ;; esac
+systemctl disable --now reboot-when-idle.timer || true
+systemctl disable reboot-when-idle-boot.service reboot-when-idle-trial.service || true

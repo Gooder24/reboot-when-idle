@@ -1,0 +1,650 @@
+#!/bin/bash
+# reboot-when-idle: reboot a Linux machine after updates, but only while nothing works on it.
+# Made for machines that run AI coding agents unattended; see README.md.
+#
+#   reboot-when-idle status                is a reboot due, what would hold it back now, what needs a look
+#   reboot-when-idle hold <command> [arg]  run a command; no automatic reboot while it runs
+#   reboot-when-idle hook prompt|tool|end|close   agent hooks: prompt, tool call, end of turn, end of session
+#   reboot-when-idle run                   the nightly timer (root): reboot when due and idle, retry a while
+#   reboot-when-idle boot early|check      at boot (root): keep or undo the trial of a new kernel
+#   reboot-when-idle --self-test           check the logic that needs no machine
+#
+# Due: a newer kernel is installed, /run/reboot-required exists, or the machine is up MAX_UPTIME_DAYS.
+# Busy: an agent turn or a conversation paused for less than PAUSE_MINUTES (hooks), a command under `hold`,
+# anything people or agents started in a login session (SSH, terminals, detached agent commands), a logind
+# lock that blocks shutdown, apt or dpkg, typing on a terminal. Work older than AGENT_COMMAND_HOURS is a server.
+# A new kernel is started once on trial (GRUB): if it brings no network up, crashes or hangs, the machine
+# goes back to the kernel that worked and does not try that one again.
+set -uo pipefail
+
+MAX_UPTIME_DAYS=30           # reboot after this long even without updates
+RETRY_SECONDS=600            # how often to look again while something works
+TRY_SECONDS=10800            # how long one night's attempt lasts
+GRACE_SECONDS=60             # announced to agents before the reboot; work starting meanwhile calls it off
+TYPING_MINUTES=30            # a terminal typed on this recently means someone works
+PAUSE_MINUTES=30             # after an agent's turn the conversation may go on: it holds this long
+AGENT_COMMAND_HOURS=12       # work running longer than this (a dev server, an editor left open) no longer counts
+HOLD_HOURS=2                 # an agent turn with no tool call for this long (interrupted) no longer counts
+STARTUP_SECONDS=60           # what an agent's server starts this soon after itself is part of it, not work
+KERNEL_WITHOUT_TRIAL=wait    # wait or reboot, for a new kernel that GRUB cannot start once on trial
+KERNEL_WAIT_DAYS=0           # a new kernel waits this long here (let another machine try it first)
+TRIAL_NETWORK_SECONDS=600    # how long a new kernel gets to bring the network up
+NETWORK_CHECK='ip route get 1.1.1.1'
+DRY_RUN=0                    # 1: only say what would be done
+REBOOT_COMMAND='systemctl reboot --check-inhibitors=yes'
+AGENT_NAMES='claude codex gemini cursor-agent goose opencode amp copilot aider'
+AGENT_COMMAND_PATTERN='/\.claude/shell-snapshots/snapshot-'  # in the command line of every Claude Code command
+SESSION_CGROUPS='/sys/fs/cgroup/user.slice/user-*.slice/session-*.scope'
+RUN_DIR=/run/reboot-when-idle
+STATE_DIR=/var/lib/reboot-when-idle
+BOOT_DIR=/boot
+GRUB_CFG=/boot/grub/grub.cfg
+GRUB_EDITENV=grub-editenv
+GRUB_REBOOT=grub-reboot
+GRUB_SET_DEFAULT=grub-set-default
+conf=${REBOOT_WHEN_IDLE_CONF:-/etc/reboot-when-idle.conf}
+[[ ! -r $conf ]] || . "$conf"
+PATH=$PATH:/usr/sbin:/sbin
+
+# --- kernels ------------------------------------------------------------------------------------------
+
+flavour() {  # 6.12.107+deb13-amd64 -> amd64, 6.12.107+deb13-rt-amd64 -> rt-amd64, 6.1.0-18-amd64 -> amd64
+  local f=${1#*-}
+  [[ $f =~ ^[0-9]+-(.*)$ ]] && f=${BASH_REMATCH[1]}
+  echo "$f"
+}
+
+newer() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | tail -1) == "$1" ]]; }  # newer A B
+
+newest_kernel() {  # newest_kernel <running> <installed>...: the newest installed one of the running flavour
+  local running=$1 release
+  shift
+  for release; do
+    [[ $(flavour "$release") != "$(flavour "$running")" ]] || echo "$release"
+  done | sort -V | tail -1
+}
+
+# kernel_reason <running> <its build> <installed build of it> <kernel that failed its trial> <installed>...
+kernel_reason() {
+  local running=$1 build=$2 installed_build=$3 failed=$4 newest
+  shift 4
+  newest=$(newest_kernel "$running" "$@")
+  if [[ -n $newest ]] && newer "$newest" "$running"; then
+    [[ $newest == "$failed" ]] || echo "kernel $newest is installed, $running runs"
+  elif [[ -n $build && -n $installed_build && $build != "$installed_build" ]]; then
+    echo "kernel $running was rebuilt: $installed_build is installed, $build runs"
+  fi
+}
+
+kernel_complete() {  # its initrd is there (if the running kernel has one) and dpkg finished installing it
+  local status
+  [[ ! -e $BOOT_DIR/initrd.img-$(uname -r) || -e $BOOT_DIR/initrd.img-$1 ]] || return 1
+  status=$(dpkg-query -W -f='${db:Status-Abbrev}' "linux-image-$1" 2> /dev/null) || return 0
+  [[ $status == ii* ]]
+}
+
+kernel_settled() {  # installed at least KERNEL_WAIT_DAYS ago
+  ((KERNEL_WAIT_DAYS == 0)) || (($(stat -c %Z "$BOOT_DIR/vmlinuz-$1") <= $(date +%s) - KERNEL_WAIT_DAYS * 86400))
+}
+
+installed_kernels() {  # installed_kernels [all]: the kernels a reboot may start (all: every one in /boot)
+  local file release running
+  running=$(uname -r)
+  for file in "$BOOT_DIR"/vmlinuz-*; do
+    [[ -e $file ]] || continue
+    release=${file##*/vmlinuz-}
+    [[ ${1:-} == all || $release == "$running" ]] || { kernel_complete "$release" && kernel_settled "$release"; } ||
+      continue
+    echo "$release"
+  done
+}
+
+grub_entry() {  # grub_entry <release> < grub.cfg: how GRUB names that kernel's entry, with its submenu
+  awk -v r="$1" '
+    match($0, /\$menuentry_id_option \047[^\047]*\047/) {
+      id = substr($0, RSTART + 22, RLENGTH - 23)
+      if ($1 == "submenu") menu = id
+      else if ($1 == "menuentry" && index(id, "gnulinux-" r "-advanced-") == 1) {
+        print (menu != "" ? menu ">" : "") id
+        exit
+      }
+    }'
+}
+
+trial_support() {  # yes, no, or unknown (GRUB's configuration is for root only): does GRUB start the saved
+  # entry, so that a one-time entry falls back to it
+  if ! command -v "$GRUB_REBOOT" > /dev/null || [[ ! -e $GRUB_CFG ]]; then
+    echo no
+  elif [[ ! -r $GRUB_CFG ]]; then
+    echo unknown
+  elif grep -qF 'set default="${saved_entry}"' "$GRUB_CFG"; then
+    echo yes
+  else
+    echo no
+  fi
+}
+
+trial_supported() { [[ $(trial_support) == yes ]]; }
+
+saved_entry() { $GRUB_EDITENV list 2> /dev/null | sed -n 's/^saved_entry=//p'; }
+
+pin_kernel() {  # pin_kernel <release>: GRUB starts this one from now on
+  local entry
+  entry=$(grub_entry "$1" < "$GRUB_CFG")
+  [[ -n $entry ]] && $GRUB_SET_DEFAULT "$entry"
+}
+
+trial_get() {  # trial_get <key>: from the record of the last kernel trial
+  local key value
+  [[ -r $STATE_DIR/trial ]] || return 0
+  while IFS='=' read -r key value; do [[ $key != "$1" ]] || echo "$value"; done < "$STATE_DIR/trial"
+}
+
+trial_put() {  # trial_put <kernel> <from> <state> <reason>
+  mkdir -p "$STATE_DIR" &&
+    printf 'kernel=%s\nfrom=%s\nstate=%s\nreason=%s\ndate=%s\n' "$1" "$2" "$3" "$4" "$(date '+%F %R')" \
+      > "$STATE_DIR/trial.new" && mv -f "$STATE_DIR/trial.new" "$STATE_DIR/trial"
+}
+
+failed_kernel() { [[ ! $(trial_get state) =~ ^(failed|reverted)$ ]] || trial_get kernel; }
+
+# --- is a reboot due ----------------------------------------------------------------------------------
+
+kernel_due() {
+  local running
+  running=$(uname -r)
+  kernel_reason "$running" "$(sed -n 's/.* Debian \([^ ]*\) (.*/\1/p' /proc/version)" \
+    "$(dpkg-query -W -f='${Version}' "linux-image-$running" 2> /dev/null)" "$(failed_kernel)" \
+    $(installed_kernels)
+}
+
+untried_kernel_waits() {  # a new kernel is due, GRUB cannot try it once and go back, and the settings say wait:
+  # then any reboot would start it (GRUB starts the newest), so nothing reboots
+  [[ $KERNEL_WITHOUT_TRIAL == wait && $(trial_support) == no && $(kernel_due) == 'kernel '*' is installed'* ]]
+}
+
+reasons_due() {
+  local days packages
+  ! untried_kernel_waits || return 0
+  kernel_due
+  if [[ -e /run/reboot-required ]]; then
+    packages=$(sort -u /run/reboot-required.pkgs 2> /dev/null | paste -sd' ')
+    echo "a package asked for it${packages:+: $packages}"
+  fi
+  days=$(($(cut -d. -f1 /proc/uptime) / 86400))
+  ((days < MAX_UPTIME_DAYS)) || echo "up for $days days"
+}
+
+# --- is something working -----------------------------------------------------------------------------
+
+lives() {  # lives <pid> <start time or empty>: the process runs (no zombie) and is the one that was meant
+  local stat
+  { stat=$(< "/proc/$1/stat"); } 2> /dev/null || return 1
+  stat=${stat##*) }
+  set -- "$2" $stat
+  [[ $2 != Z && $2 != X && (-z $1 || $1 == "${21}") ]]
+}
+
+start_time() {
+  local stat
+  { stat=$(< "/proc/$1/stat"); } 2> /dev/null || return 1
+  stat=${stat##*) }
+  set -- $stat
+  echo "${20}"
+}
+
+holds() {  # the files `hold` and the agent hooks leave; ones whose process is gone are removed
+  local file key value pid start kind paused what now changed
+  now=$(date +%s)
+  for file in "$RUN_DIR"/hold/*; do
+    [[ -f $file && ! -L $file ]] || continue
+    pid='' start='' kind='' paused='' what=''
+    while IFS='=' read -r key value; do
+      case $key in
+        pid) pid=$value ;; start) start=$value ;; kind) kind=$value ;; paused) paused=$value ;; what) what=$value ;;
+      esac
+    done < "$file"
+    what=${what//[^[:print:]]/}
+    changed=$(stat -c %Y "$file")
+    if [[ ! $pid =~ ^[0-9]+$ || ! $start =~ ^[0-9]+$ ]] || ! lives "$pid" "$start"; then
+      rm -f "$file" 2> /dev/null
+    elif [[ $kind == agent && -n $paused ]]; then
+      ((changed < now - PAUSE_MINUTES * 60)) ||
+        echo "a conversation with $what, paused $(((now - changed) / 60)) min ago"
+    elif [[ $kind == agent ]] && ((changed < now - HOLD_HOURS * 3600)); then
+      :  # a turn that went quiet (interrupted): it counts again with its next tool call
+    else
+      echo "$what (pid $pid)"
+    fi
+  done
+}
+
+agent_commands() {  # agent_commands young|old: how many commands agents run, also ones left after a turn
+  local pid age count=0 limit=$((AGENT_COMMAND_HOURS * 3600))
+  for pid in $(pgrep -f "$AGENT_COMMAND_PATTERN"); do
+    age=$(ps -o etimes= -p "$pid" 2> /dev/null | tr -d ' ')
+    [[ -n $age ]] || continue
+    if [[ $1 == young ]]; then
+      ((age >= limit)) || count=$((count + 1))
+    else
+      ((age < limit)) || count=$((count + 1))
+    fi
+  done
+  echo "$count"
+}
+
+blocking_locks() {  # blocking_locks <count> <ListInhibitors as JSON>: the ones that block shutdown
+  local count=$1 s='"((\\.|[^"\\])*)"' entries mode what text seen=0
+  entries=$(grep -oE "\[$s,$s,$s,$s,[0-9]+,[0-9]+\]" <<< "$2" |
+    sed -E "s/^\[$s,$s,$s,$s,.*/\7 \1 \3 holds a lock: \5/")
+  while read -r mode what text; do
+    [[ -n $mode ]] || continue
+    seen=$((seen + 1))
+    [[ $mode != block* || :$what: != *:shutdown:* ]] || echo "$text"
+  done <<< "$entries"
+  ((seen >= count)) || echo "$((count - seen)) lock(s) this script cannot read"
+}
+
+agent_program() {  # agent_program <argv0> <argv1>: a coding agent, run directly or as a node/bun/python script
+  local name=${1##*/} script=${2##*/}
+  [[ " $AGENT_NAMES " != *" $name "* ]] || return 0
+  [[ $name =~ ^(node|bun|deno|python3?)$ ]] || return 1
+  [[ " $AGENT_NAMES " == *" ${script%.*} "* || $2 =~ @anthropic-ai/claude-code|@openai/codex|@google/gemini-cli ]]
+}
+
+is_agent() {
+  local args=()
+  { mapfile -d '' args < "/proc/$1/cmdline"; } 2> /dev/null || return 1
+  agent_program "${args[0]:-}" "${args[1]:-}"
+}
+
+age() { ((${1} < 3600)) && echo "$(($1 / 60)) min" || echo "$(($1 / 3600)) h"; }
+
+session_work() {  # session_work young|old: what people and agents run in login sessions, as "name (pid, age)"
+  # Every process started over SSH, in a terminal or by an agent (also detached with nohup, setsid or &)
+  # stays in its login session's cgroup. Not work there: shells, the agents themselves and whatever runs
+  # them (T3 Code's server and what it starts with itself), an agent's own helpers, this script.
+  local -A parent since name above
+  local pid p a c cg list=() limit=$((AGENT_COMMAND_HOURS * 3600))
+  while read -r pid p a c; do
+    parent[$pid]=$p since[$pid]=$a name[$pid]=$c
+  done < <(ps -e -o pid=,ppid=,etimes=,comm= 2> /dev/null)
+  for cg in $SESSION_CGROUPS; do
+    [[ ! -r $cg/cgroup.procs ]] || list+=($(< "$cg/cgroup.procs"))
+  done
+  for pid in "${list[@]}"; do
+    [[ -n ${name[$pid]:-} ]] && is_agent "$pid" || continue
+    for ((p = pid; p > 1 && ${#parent[$p]}; p = ${parent[$p]})); do above[$p]=1; done
+  done
+  for pid in "${list[@]}"; do
+    [[ -n ${name[$pid]:-} && -z ${above[$pid]:-} ]] || continue
+    case ${name[$pid]} in bash | sh | dash | zsh | fish | login | sshd | sshd-session | tmux* | screen | sudo | su) continue ;; esac
+    p=${parent[$pid]}
+    if [[ -n ${above[$p]:-} ]]; then
+      ! is_agent "$p" || continue
+      ((${since[$p]} - ${since[$pid]} >= STARTUP_SECONDS)) || continue
+    fi
+    for ((p = pid; p > 1 && p != $$ && ${#parent[$p]}; p = ${parent[$p]})); do :; done
+    ((p != $$)) || continue
+    if { [[ $1 == young ]] && ((${since[$pid]} < limit)); } || { [[ $1 == old ]] && ((${since[$pid]} >= limit)); }; then
+      echo "${name[$pid]} (pid $pid, $(age "${since[$pid]}"))"
+    fi
+  done
+}
+
+package_manager_runs() {  # apt and dpkg lock one of these files while they work
+  local file inode
+  ! pgrep -x 'apt|apt-get|aptitude|dpkg' > /dev/null || return 0
+  for file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+    inode=$(stat -c %i "$file" 2> /dev/null) || continue
+    ! grep -q ":$inode " /proc/locks || return 0
+  done
+  return 1
+}
+
+reasons_busy() {
+  local count work
+  holds
+  count=$(agent_commands young)
+  ((count == 0)) || echo "an agent runs $count command(s)"
+  work=$(session_work young)
+  [[ -z $work ]] || echo "running in login sessions: $(joined <<< "$work")"
+  count=$(busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager \
+    ListInhibitors 2> /dev/null | cut -d' ' -f2)
+  if [[ ! $count =~ ^[0-9]+$ ]]; then
+    echo "logind does not answer about its locks"
+  elif ((count > 0)); then
+    blocking_locks "$count" "$(busctl --json=short call org.freedesktop.login1 /org/freedesktop/login1 \
+      org.freedesktop.login1.Manager ListInhibitors)"
+  fi
+  ! package_manager_runs || echo "the package manager runs"
+  [[ -z $(find /dev/pts -maxdepth 1 -name '[0-9]*' -amin "-$TYPING_MINUTES" 2> /dev/null
+    find /dev -maxdepth 1 -name 'tty[1-9]*' -amin "-$TYPING_MINUTES" 2> /dev/null) ]] ||
+    echo "someone typed on a terminal in the last $TYPING_MINUTES minutes"
+}
+
+attention() {  # what a person should look at
+  local days release
+  if untried_kernel_waits; then
+    echo "kernel $(kernel_due | sed 's/^kernel \([^ ]*\).*/\1/') waits: GRUB here cannot start it once and go back if it fails" \
+      "(set it up with 'make enable', or KERNEL_WITHOUT_TRIAL=reboot); until then nothing reboots"
+  fi
+  for release in $(installed_kernels all); do
+    [[ $release == "$(uname -r)" ]] || kernel_complete "$release" ||
+      echo "kernel $release looks half-installed (no initrd, or dpkg did not finish): no reboot into it"
+  done
+  if [[ $(trial_get state) =~ ^(failed|reverted)$ ]]; then
+    echo "kernel $(trial_get kernel) failed its trial boot on $(trial_get date): $(trial_get reason)"
+  fi
+  if [[ -e $STATE_DIR/due-since ]]; then
+    days=$((($(date +%s) - $(stat -c %Y "$STATE_DIR/due-since")) / 86400))
+    ((days < 7)) || echo "a reboot is due since $(< "$STATE_DIR/due-since"), every night something was working"
+  fi
+  [[ -d $RUN_DIR/hold ]] || echo "$RUN_DIR/hold is missing, so agent turns cannot hold the reboot"
+}
+
+joined() { paste -sd';' | sed 's/;/; /g'; }
+
+uptime_seconds() { cut -d. -f1 /proc/uptime; }
+
+# --- the nightly run ----------------------------------------------------------------------------------
+
+reboot_now() {  # reboot_now <reasons>: boot a new kernel on trial if that is the reason, then reboot
+  local running newest entry
+  running=$(uname -r)
+  newest=$(newest_kernel "$running" $(installed_kernels))
+  if [[ $1 == "kernel $newest is installed"* ]]; then
+    if trial_supported; then
+      entry=$(grub_entry "$newest" < "$GRUB_CFG")
+      if [[ -z $entry ]] || ! pin_kernel "$running" || ! $GRUB_REBOOT "$entry"; then
+        trial_put "$newest" "$running" failed 'GRUB could not be set up to start it once'
+        echo "cannot set up GRUB to start kernel $newest once; not rebooting for it"
+        return 1
+      fi
+      echo "kernel $newest starts once on trial; $running stays the default until it proves itself"
+    fi
+    trial_put "$newest" "$running" pending 'rebooted into it'
+  fi
+  rm -f "$STATE_DIR/due-since"
+  mkdir -p "$STATE_DIR" && echo "$(date '+%F %R'): $(joined <<< "$1")" > "$STATE_DIR/last-reboot"
+  $REBOOT_COMMAND && return 0
+  echo "the reboot command failed: $REBOOT_COMMAND"
+  trial_supported && $GRUB_EDITENV - unset next_entry 2> /dev/null
+  [[ $(trial_get state) != pending ]] || trial_put "$(trial_get kernel)" "$(trial_get from)" none 'reboot failed'
+  return 1
+}
+
+run() {
+  local deadline due busy
+  if [[ $EUID -ne 0 && $DRY_RUN != 1 && $REBOOT_COMMAND == 'systemctl reboot'* ]]; then
+    echo 'reboot-when-idle run: needs root (or DRY_RUN=1)' >&2
+    return 1
+  fi
+  mkdir -p "$RUN_DIR/hold" && chmod 1777 "$RUN_DIR/hold" 2> /dev/null
+  deadline=$(($(uptime_seconds) + TRY_SECONDS))
+  while :; do
+    due=$(reasons_due)
+    if [[ -z $due ]]; then
+      rm -f "$STATE_DIR/due-since"
+      echo 'no reboot due'
+      attention
+      return 0
+    fi
+    busy=$(reasons_busy)
+    if [[ -z $busy ]]; then
+      if [[ $DRY_RUN == 1 ]]; then
+        echo "nothing is working, would reboot: $(joined <<< "$due")"
+        return 0
+      fi
+      echo "nothing is working; rebooting in $GRACE_SECONDS s unless work starts: $(joined <<< "$due")"
+      echo "$(joined <<< "$due")" > "$RUN_DIR/rebooting"
+      sleep "$GRACE_SECONDS"
+      busy=$(reasons_busy)
+      if [[ -z $busy ]]; then
+        reboot_now "$due" && return 0
+      else
+        echo "work started meanwhile: $(joined <<< "$busy")"
+      fi
+      rm -f "$RUN_DIR/rebooting"
+    else
+      echo "reboot due ($(joined <<< "$due")), waiting: $(joined <<< "$busy")"
+      [[ $DRY_RUN == 1 || -e $STATE_DIR/due-since ]] ||
+        { mkdir -p "$STATE_DIR" && date '+%F %R' > "$STATE_DIR/due-since"; }
+    fi
+    if (($(uptime_seconds) + RETRY_SECONDS > deadline)); then
+      echo 'no quiet moment this night, trying again the next one'
+      attention
+      return 0
+    fi
+    sleep "$RETRY_SECONDS"
+  done
+}
+
+# --- at boot ------------------------------------------------------------------------------------------
+
+boot_early() {  # a one-time entry is used up now (GRUB cannot do it itself on btrfs), so a crash falls back
+  local next
+  next=$($GRUB_EDITENV list 2> /dev/null | sed -n 's/^next_entry=//p')
+  [[ -n $next ]] || return 0
+  $GRUB_EDITENV - unset next_entry && echo "used up the one-time boot entry $next"
+}
+
+network_comes_up() {  # within TRIAL_NETWORK_SECONDS
+  local end=$(($(uptime_seconds) + TRIAL_NETWORK_SECONDS))
+  until $NETWORK_CHECK > /dev/null 2>&1; do
+    (($(uptime_seconds) < end)) || return 1
+    sleep 5
+  done
+}
+
+boot_check() {
+  local kernel from running
+  kernel=$(trial_get kernel) from=$(trial_get from) running=$(uname -r)
+  case $(trial_get state) in
+    pending)
+      if [[ $running != "$kernel" ]]; then
+        trial_put "$kernel" "$from" failed "it did not come up (crash or hang), $running started instead"
+        echo "kernel $kernel did not come up, $running started instead; it will not be tried again"
+      elif network_comes_up; then
+        ! trial_supported || pin_kernel "$kernel"
+        trial_put "$kernel" "$from" ok 'the network came up with it'
+        echo "kernel $kernel works and is the default now"
+      elif trial_supported; then
+        trial_put "$kernel" "$from" reverted "no network within $TRIAL_NETWORK_SECONDS s"
+        echo "kernel $kernel brought no network up, going back to $from"
+        $REBOOT_COMMAND
+      else
+        trial_put "$kernel" "$from" failed "no network within $TRIAL_NETWORK_SECONDS s, and GRUB cannot go back"
+        echo "kernel $kernel brought no network up; GRUB does not start a saved entry, so it cannot go back"
+      fi
+      ;;
+    reverted)
+      [[ $running == "$from" ]] || return 0
+      if network_comes_up; then
+        trial_put "$kernel" "$from" failed "no network with it, $from has one"
+        echo "back on $from with network: kernel $kernel will not be tried again"
+      else
+        trial_put "$kernel" "$from" retry "no network with $kernel nor with $from, so not the kernel's fault"
+        echo "no network with $from either; kernel $kernel will be tried again"
+      fi
+      ;;
+    *)  # no trial under way: make sure GRUB starts a kernel that exists, the running one if not
+      if trial_supported && [[ -z $(grub_ids < "$GRUB_CFG" | grep -Fx -- "$(saved_entry | sed 's/.*>//')") ]]; then
+        pin_kernel "$running" && echo "GRUB starts $running from now on"
+      fi
+      ;;
+  esac
+}
+
+grub_ids() { grep -o "\$menuentry_id_option '[^']*'" | sed "s/.* '\(.*\)'/\1/"; }
+
+# --- agents and commands that hold the reboot ---------------------------------------------------------
+
+json_field() {  # json_field <name> <json>: a string value, escapes kept
+  sed -n "s/.*\"$1\" *: *\"\(\([^\"\\\\]\|\\\\.\)*\)\".*/\1/p" <<< "$2" | head -1
+}
+
+agent_pid() {  # the agent that runs this hook: the first ancestor that is not a shell
+  local pid=$PPID comm
+  while ((pid > 1)); do
+    { comm=$(< "/proc/$pid/comm"); } 2> /dev/null || return 1
+    case $comm in
+      bash | sh | dash | zsh | env | timeout | nice | nohup) pid=$(ps -o ppid= -p "$pid" | tr -d ' ') ;;
+      *) echo "$pid" && return 0 ;;
+    esac
+  done
+  return 1
+}
+
+write_agent_hold() {  # write_agent_hold <file> <hook input> <paused since, or nothing while it works>
+  local pid cwd
+  pid=$(agent_pid) || return 0
+  cwd=$(json_field cwd "$2")
+  { printf 'pid=%s\nstart=%s\nkind=agent\npaused=%s\nwhat=%s\n' "$pid" "$(start_time "$pid")" "$3" \
+    "$(< "/proc/$pid/comm")${cwd:+ in $cwd}" > "$1.new" && mv -f "$1.new" "$1"; } 2> /dev/null
+}
+
+hook() {  # hook prompt|tool|end|close, the agent's event as JSON on stdin; prints nothing, never fails the agent
+  local input session file key value pid='' paused=''
+  input=$(cat)
+  session=$(json_field session_id "$input")
+  [[ -n $session ]] || session=$(json_field conversation_id "$input")  # Cursor names it so
+  [[ $session =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+  file=$RUN_DIR/hold/agent-$session
+  case $1 in
+    prompt | tool)
+      if [[ $1 == prompt && -e $RUN_DIR/rebooting ]] &&
+        (($(date +%s) - $(stat -c %Y "$RUN_DIR/rebooting") < GRACE_SECONDS + 300)); then
+        echo "This machine is rebooting now ($(< "$RUN_DIR/rebooting")). It will be back in a few minutes;" \
+          'send the message again then.' >&2
+        return 2
+      fi
+      if [[ -f $file ]]; then
+        while IFS='=' read -r key value; do
+          case $key in pid) pid=$value ;; paused) paused=$value ;; esac
+        done < "$file"
+        # the same turn goes on: only say so
+        [[ -n $paused || ! $pid =~ ^[0-9]+$ ]] || ! lives "$pid" '' || { touch -c "$file"; return 0; }
+      fi
+      write_agent_hold "$file" "$input" ''
+      ;;
+    end)  # the turn is over; with background tasks or scheduled prompts left the agent still works
+      if grep -q '"\(background_tasks\|session_crons\)" *: *\[ *{' <<< "$input"; then
+        write_agent_hold "$file" "$input" ''
+      else
+        write_agent_hold "$file" "$input" "$(date +%s)"
+      fi
+      ;;
+    close) rm -f "$file" ;;
+  esac
+  return 0
+}
+
+hold() {
+  if [[ $# -eq 0 ]]; then
+    echo 'usage: reboot-when-idle hold <command> [args...]' >&2
+    return 2
+  fi
+  local file=$RUN_DIR/hold/command-$$
+  { printf 'pid=%s\nstart=%s\nkind=command\nwhat=%s\n' $$ "$(start_time $$)" "$*" > "$file.new" &&
+    mv -f "$file.new" "$file"; } 2> /dev/null || echo "reboot-when-idle: cannot write to $RUN_DIR/hold, running without holding the reboot" >&2
+  exec "$@"  # the same pid, so the hold lasts exactly as long as the command
+}
+
+# --- status -------------------------------------------------------------------------------------------
+
+status() {
+  local due busy look old release
+  due=$(reasons_due) busy=$(reasons_busy) look=$(attention) old=$(agent_commands old)
+  if [[ -n $due ]]; then
+    echo 'reboot due:'
+    sed 's/^/  /' <<< "$due"
+  else
+    echo "no reboot due (kernel $(uname -r), up $(($(uptime_seconds) / 86400)) days)"
+  fi
+  if [[ -n $busy ]]; then
+    echo 'working now, a reboot would wait:'
+    sed 's/^/  /' <<< "$busy"
+  else
+    echo 'nothing is working now'
+  fi
+  ((old == 0)) || echo "not counted: $old agent command(s) running longer than $AGENT_COMMAND_HOURS h (servers?)"
+  old=$(session_work old)
+  [[ -z $old ]] || echo "not counted, running longer than $AGENT_COMMAND_HOURS h: $(joined <<< "$old")"
+  for release in $(installed_kernels all); do
+    kernel_complete "$release" && ! kernel_settled "$release" &&
+      echo "kernel $release waits until $(date -d "@$(($(stat -c %Z "$BOOT_DIR/vmlinuz-$release") + KERNEL_WAIT_DAYS * 86400))" '+%F') (KERNEL_WAIT_DAYS)"
+  done
+  [[ $(trial_support) != unknown ]] || echo '(run as root to also see whether GRUB can start a new kernel on trial)'
+  if [[ -n $look ]]; then
+    echo 'needs a look:'
+    sed 's/^/  /' <<< "$look"
+  fi
+  [[ ! -e $STATE_DIR/due-since ]] || echo "due since $(< "$STATE_DIR/due-since")"
+  [[ ! -e $STATE_DIR/last-reboot ]] || echo "last reboot by reboot-when-idle: $(< "$STATE_DIR/last-reboot")"
+  [[ ! -e $STATE_DIR/trial ]] ||
+    echo "last kernel trial: $(trial_get kernel) $(trial_get state) ($(trial_get reason), $(trial_get date))"
+  systemctl list-timers reboot-when-idle.timer --no-pager --no-legend 2> /dev/null |
+    awk 'NF { print "next try: " $1, $2, $3, $4 }'
+}
+
+# --- self-test ----------------------------------------------------------------------------------------
+
+self_test() {
+  local k=6.12.107+deb13-amd64 n=6.12.111+deb13-amd64 json cfg u=bd22-49f0
+  fail() { echo "reboot-when-idle: self-test failed on line $1" >&2; exit 1; }
+  [[ $(kernel_reason $k 6.12.107-1 6.12.107-1 '' $k $n) == "kernel $n is installed, $k runs" ]] || fail $LINENO
+  [[ -z $(kernel_reason $k 6.12.107-1 6.12.107-1 '' $k) ]] || fail $LINENO
+  [[ -z $(kernel_reason $n 6.12.111-1 6.12.111-1 '' $k $n) ]] || fail $LINENO  # an older one left installed
+  [[ -z $(kernel_reason $k 6.12.107-1 6.12.107-1 $n $k $n) ]] || fail $LINENO   # $n failed its trial
+  [[ $(kernel_reason $k 6.12.107-1 6.12.107-1 $n $k $n 6.12.115+deb13-amd64) == 'kernel 6.12.115'* ]] ||
+    fail $LINENO  # a newer one than the failed one is tried
+  [[ $(kernel_reason 6.12.9+deb13-amd64 x x '' 6.12.9+deb13-amd64 6.12.10+deb13-amd64) == kernel* ]] || fail $LINENO
+  [[ $(kernel_reason $n 6.12.111-1 6.12.111-2 '' $n) == *rebuilt* ]] || fail $LINENO
+  [[ -z $(kernel_reason $n '' 6.12.111-2 '' $n) ]] || fail $LINENO  # no Debian build in /proc/version
+  [[ -z $(kernel_reason $k x x '' $k 6.12.111+deb13-rt-amd64) ]] || fail $LINENO
+  [[ $(kernel_reason 6.1.0-18-amd64 x x '' 6.1.0-18-amd64 6.1.0-21-amd64) == 'kernel 6.1.0-21-amd64 is'* ]] ||
+    fail $LINENO
+  json='{"type":"a(ssssuu)","data":[[["shutdown","Backup","nightly copy","block",0,42],'
+  json+='["sleep:shutdown","iwd","roaming","delay",0,7],["idle:sleep:shutdown","job","x","block",0,9]]]}'
+  [[ $(blocking_locks 3 "$json") == $'Backup holds a lock: nightly copy\njob holds a lock: x' ]] || fail $LINENO
+  [[ -z $(blocking_locks 1 '{"data":[[["sleep","a","b","block",0,1]]]}') ]] || fail $LINENO
+  [[ -z $(blocking_locks 1 '{"data":[[["shutdown","backup","copy \"home\"","delay",0,77]]]}') ]] || fail $LINENO
+  [[ $(blocking_locks 1 '{"data":[[["shutdown","a \"q\"","b\\c","block",0,1]]]}') == 'a \"q\" holds a lock: b\\c' ]] ||
+    fail $LINENO
+  [[ $(blocking_locks 1 '{"data":[[["shutdown","x","y","block-weak",0,1]]]}') == 'x holds a lock: y' ]] || fail $LINENO
+  [[ $(blocking_locks 2 '{"data":[[["shutdown","x","y","block",0,1]]]}') == *'1 lock(s) this script'* ]] || fail $LINENO
+  agent_program /home/a/.local/bin/claude --output-format || fail $LINENO
+  agent_program node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js || fail $LINENO
+  agent_program /usr/bin/codex exec || fail $LINENO
+  agent_program node /usr/local/bin/gemini || fail $LINENO
+  agent_program vim /home/a/claude && fail $LINENO
+  agent_program node /home/a/t3/server.js && fail $LINENO
+  agent_program bash -c && fail $LINENO
+  json='{"session_id":"abc-1","cwd":"/home/a/osobn\u00e9 \"x\"","prompt":"say \"session_id\": \"evil\""}'
+  [[ $(json_field session_id "$json") == abc-1 ]] || fail $LINENO
+  [[ $(json_field cwd "$json") == '/home/a/osobn\u00e9 \"x\"' ]] || fail $LINENO
+  [[ -z $(json_field session_id 'not json') ]] || fail $LINENO
+  [[ $(json_field conversation_id '{"conversation_id": "c-9", "workspace_roots": ["/w"]}') == c-9 ]] || fail $LINENO
+  cfg="menuentry 'Debian GNU/Linux' --class debian \$menuentry_id_option 'gnulinux-simple-$u' {
+submenu 'Advanced options for Debian GNU/Linux' \$menuentry_id_option 'gnulinux-advanced-$u' {
+	menuentry 'Debian GNU/Linux, with Linux $n' --class debian \$menuentry_id_option 'gnulinux-$n-advanced-$u' {
+	menuentry 'Debian GNU/Linux, with Linux $n (recovery mode)' \$menuentry_id_option 'gnulinux-$n-recovery-$u' {
+	menuentry 'Debian GNU/Linux, with Linux $k (recovery mode)' \$menuentry_id_option 'gnulinux-$k-recovery-$u' {
+	menuentry 'Debian GNU/Linux, with Linux $k' --class debian \$menuentry_id_option 'gnulinux-$k-advanced-$u' {"
+  [[ $(grub_entry $k <<< "$cfg") == "gnulinux-advanced-$u>gnulinux-$k-advanced-$u" ]] || fail $LINENO
+  [[ $(grub_entry $n <<< "$cfg") == "gnulinux-advanced-$u>gnulinux-$n-advanced-$u" ]] || fail $LINENO
+  [[ -z $(grub_entry 6.12.1+deb13-amd64 <<< "$cfg") ]] || fail $LINENO  # 6.12.1 is not 6.12.111
+  [[ $(grub_ids <<< "$cfg" | wc -l) == 6 ]] || fail $LINENO
+  echo 'reboot-when-idle: self-test ok'
+}
+
+case ${1:-} in
+  status) status ;;
+  hold) shift; hold "$@" ;;
+  hook) hook "${2:-}" ;;
+  run) run ;;
+  boot) case ${2:-} in early) boot_early ;; check) boot_check ;; *) exit 2 ;; esac ;;
+  --self-test) self_test ;;
+  *) sed -n '2,16s/^# \{0,1\}//p' "$0"; exit 2 ;;
+esac

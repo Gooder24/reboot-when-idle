@@ -1,0 +1,17 @@
+#!/bin/sh
+# Switches reboot-when-idle on: the holds directory, the timer, the boot checks, GRUB (saved default,
+# panic=10), and points GRUB at the running kernel. Run again it changes nothing that is already so.
+set -e
+[ "${1:-configure}" = configure ] || exit 0
+bin=${BINDIR:-/usr/bin}
+systemd-tmpfiles --create reboot-when-idle.conf
+systemctl enable reboot-when-idle-boot.service reboot-when-idle-trial.service reboot-when-idle.timer
+if [ -d /run/systemd/system ]; then  # not in a chroot (an installer): there the timer starts with the system
+  systemctl daemon-reload
+  systemctl start reboot-when-idle.timer
+fi
+if command -v update-grub > /dev/null; then update-grub; fi
+# Points GRUB at the running kernel. In an installer's chroot the running kernel may not be the installed
+# one; reboot-when-idle-trial.service does it at the first start then.
+"$bin/reboot-when-idle" boot check || echo 'reboot-when-idle: GRUB is set at the next start' >&2
+# The watchdog setting (/etc/systemd/system.conf.d) takes effect with the next boot.

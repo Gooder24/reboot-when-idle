@@ -1,0 +1,16 @@
+# Early in every boot. A one-time GRUB entry (a new kernel on trial) is used up here, because GRUB cannot
+# write its environment on btrfs and some other filesystems; a crash later in this boot then falls back.
+[Unit]
+Description=Use up a one-time boot entry, so a crash falls back to the kernel that worked
+DefaultDependencies=no
+RequiresMountsFor=/boot
+After=local-fs.target
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/reboot-when-idle boot early
+
+[Install]
+WantedBy=sysinit.target

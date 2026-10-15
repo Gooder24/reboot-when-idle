@@ -1,0 +1,9 @@
+# Started by reboot-when-idle.timer. Reboots only when a reboot is due and nothing works on the machine,
+# and keeps looking for a quiet moment for three hours before it leaves it for the next night.
+[Unit]
+Description=Reboot if this machine needs it and nothing is working on it
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/reboot-when-idle run
+TimeoutStartSec=5h

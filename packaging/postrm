@@ -1,0 +1,10 @@
+#!/bin/sh
+# GRUB goes back to its own default once the drop-in is gone; purge also forgets the kernel trials.
+set -e
+case ${1:-remove} in
+  remove | purge)
+    systemctl daemon-reload || true
+    if command -v update-grub > /dev/null; then update-grub || true; fi
+    [ "$1" != purge ] || rm -rf /var/lib/reboot-when-idle
+    ;;
+esac

@@ -1,0 +1,13 @@
+# Every night between 03:00 and 04:00, at a time of its own for each machine (from its machine-id), so that
+# several machines do not go down together.
+[Unit]
+Description=Nightly look whether this machine should reboot
+
+[Timer]
+OnCalendar=*-*-* 03:00
+RandomizedDelaySec=1h
+FixedRandomDelay=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

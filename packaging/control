@@ -1,0 +1,16 @@
+Package: reboot-when-idle
+Version: @VERSION@
+Architecture: all
+Maintainer: Gooder24 <162874774+Gooder24@users.noreply.github.com>
+Section: admin
+Priority: optional
+Depends: systemd, procps, iproute2, mawk | awk
+Recommends: unattended-upgrades, grub-common
+Description: reboot after updates, but only while nothing works on the machine
+ Made for machines that run AI coding agents unattended. A nightly timer
+ reboots when a newer kernel is installed, a package asked for it or the
+ machine has been up for a month - and only when no agent turn, agent command,
+ held job, apt run or typing is under way. Claude Code hooks tell it when an
+ agent works; "reboot-when-idle hold <command>" covers anything else. A new
+ kernel is started once on trial: without network, after a crash or a hang the
+ machine goes back to the kernel that worked.
