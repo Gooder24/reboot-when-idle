@@ -318,9 +318,16 @@ reasons_busy() {
       org.freedesktop.login1.Manager ListInhibitors)"
   fi
   ! package_manager_runs || echo "the package manager runs"
-  [[ -z $(find /dev/pts -maxdepth 1 -name '[0-9]*' -amin "-$TYPING_MINUTES" 2> /dev/null
-    find /dev -maxdepth 1 -name 'tty[1-9]*' -amin "-$TYPING_MINUTES" 2> /dev/null) ]] ||
-    echo "someone typed on a terminal in the last $TYPING_MINUTES minutes"
+  [[ -z $(typed_terminals) ]] || echo "someone typed on a terminal in the last $TYPING_MINUTES minutes"
+}
+
+typed_terminals() {  # terminals read from in the last TYPING_MINUTES
+  local boot
+  boot=$(awk '/^btime / { print $2 }' /proc/stat)
+  find /dev/pts -maxdepth 1 -name '[0-9]*' -amin "-$TYPING_MINUTES" 2> /dev/null
+  # The consoles are made at the start, and that is their access time until someone types: without the
+  # minute after the start left out, every start would look like half an hour of typing.
+  find /dev -maxdepth 1 -name 'tty[1-9]*' -amin "-$TYPING_MINUTES" -newerat "@$((boot + 60))" 2> /dev/null
 }
 
 attention() {  # what a person should look at
