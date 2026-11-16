@@ -1,0 +1,35 @@
+name: Accessibility barrier
+description: Something in reboot-when-idle is hard or impossible to use, or to read, for you.
+title: "[a11y] "
+labels: ["accessibility"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: What were you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: Paste the command and its output if you can. Remove host names, IP addresses and tokens.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Distribution and version, terminal program, and any assistive technology with its version.
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: See "Severity" in ACCESSIBILITY.md.
+      options:
+        - "Critical: I cannot complete a task at all"
+        - "Serious: I can complete it, but only with a workaround"
+        - "Moderate: I can complete it, but the experience is inconsistent or annoying"
+        - "Minor: a small problem with little effect on the task"
+    validations:
+      required: true
