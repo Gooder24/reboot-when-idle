@@ -37,7 +37,7 @@ Every night between 03:00 and 04:00 (each machine at a time of its own) a timer 
 
 **Is something working?** Any of these holds the reboot:
 
-| | how it is seen |
+| what holds the reboot | how it is seen |
 |---|---|
 | an agent turn, and its background tasks and scheduled prompts | agent hooks (below): a prompt arrives, a tool is called, the turn ends |
 | a conversation that just paused | for 30 minutes after a turn, while you read the answer and type the next prompt |
@@ -134,7 +134,7 @@ What happened at night: `journalctl -u reboot-when-idle -u reboot-when-idle-tria
 
 `/etc/reboot-when-idle.conf` (shell syntax), all optional:
 
-| | default | |
+| setting | default | meaning |
 |---|---|---|
 | `MAX_UPTIME_DAYS` | 30 | reboot after this long even without updates |
 | `RETRY_SECONDS` | 600 | how often to look again while something works |
