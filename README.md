@@ -13,6 +13,21 @@ Part of [KarchiOS Headless](https://github.com/Gooder24/karchi-os-headless-debia
 laptops that run agents around the clock, next to [laptop-server](https://github.com/Gooder24/laptop-server);
 works on its own on any systemd distribution.
 
+## Requirements
+
+- Linux with systemd. Tested on Debian 13 only.
+- bash, procps, iproute2 and awk. The Debian package depends on them.
+- For a new kernel to be tried once: GRUB (`grub-common`) with `update-grub`. Without it a new kernel waits, see below.
+- Root is needed to install and for the nightly timer. One scenario in `make test` runs a command with `sudo -n` (as root) when passwordless sudo is set up, and is skipped otherwise.
+
+## Quick start
+
+```sh
+make check
+```
+
+This checks the syntax and runs the self-test in a few seconds, without root. `make test` then runs the scenarios on this machine (about a minute; nothing reboots), and [Install](#install) puts the tool on it.
+
 ## What it does
 
 Every night between 03:00 and 04:00 (each machine at a time of its own) a timer asks:
@@ -166,7 +181,11 @@ at the end of a turn, interrupted turns, killed agents, detached commands, zombi
 left running, apt, someone typing, a reboot that fails, work starting during the announcement, every kernel
 trial outcome, a half-installed kernel, a kernel without a trial setup, no network at all, hostile files in
 the hold directory — with GRUB, the reboot, the network check and the login sessions replaced by stand-ins in
-a temporary directory.
+a temporary directory. The scenario that holds a shutdown lock runs with `sudo -n` (as root) and is skipped without passwordless sudo.
+
+## Accessibility
+
+The tool is text in a terminal: its output has no colour and no pointer input. [ACCESSIBILITY.md](ACCESSIBILITY.md) says what has been checked, what has not (a screen reader check is still to be run), and how to report a barrier.
 
 ## License
 
