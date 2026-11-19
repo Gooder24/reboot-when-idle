@@ -61,29 +61,39 @@ On every pull request and every push to `main` that changes a Markdown file or t
 | Keyboard-only smoke test | done | `--self-test`, `status`, `hold` and the usage text (no arguments) typed into a terminal with keystrokes only, no mouse; exit codes 0, 0, 0 and 2 |
 | Terminal width | done for `status` | at 40 columns all the text of `status` is there; the terminal wraps the long lines |
 | Colour | done | the tool writes no colour and no escape codes; its messages were read through |
-| Screen reader spot check | not run | needs a person with a screen reader (see below) |
+| Screen reader spot check | done, 2026-11-19 | Orca 48.1 on the README in Chromium 156 and on the commands in lxterminal; one fix, one barrier left ([#4](https://github.com/Gooder24/reboot-when-idle/issues/4)); see below |
 | Zoom | not run | the text size is set by the terminal program |
-| Documentation review | partly done | README and this file read by hand; the table header problem is tracked in [#1](https://github.com/Gooder24/reboot-when-idle/issues/1) |
+| Documentation review | done | README and this file read by hand; the empty table headers of [#1](https://github.com/Gooder24/reboot-when-idle/issues/1) are fixed, and the screen reader reads every column header |
 
-### Screen reader spot check (not run)
+### Screen reader spot check (19 November 2026)
 
-Use a screen reader in a Linux terminal, for example Orca in GNOME Terminal. Run these commands, then check that the output can be followed by ear, line by line:
+Orca 48.1 with speech-dispatcher 0.12.0 on Debian 13 (thinkpad-e540): the README as GitHub renders it, in
+Chromium 156, and these commands typed into lxterminal:
 
     reboot-when-idle --self-test
     reboot-when-idle status
     reboot-when-idle hold true; echo "exit $?"
 
-Record the terminal, the screen reader and its version here once this is done.
+An agent ran it with `citacka` (karchi-skills), which writes down the text Orca sends to the synthesizer: the
+words, not the voice. Default Orca settings, key echo off. The transcripts are in [this gist](https://gist.github.com/Gooder24/9816e5601781f40a5e0656c79b9b5252).
+
+- **README:** 13 headings, each read with its level, then GitHub's "Permalink" link; 6 links of its own, each named by its text; the three tables read
+  with their size and the column header of every cell.
+- **Fixed:** the Commands section was a code block in which each command ran into its description, read as
+  one sentence. It is a list now (`83e0ffa`).
+- **Commands:** `--self-test`, `hold` and the exit code are read in full. `status` is read line by line, but
+  the work in login sessions is one long line: [#4](https://github.com/Gooder24/reboot-when-idle/issues/4).
+- **Not checked:** NVDA, VoiceOver, a braille display, and how a voice pronounces the symbols in code.
 
 ## Supported environments
 
 - **Run on:** Debian 13 on an x86_64 laptop, with systemd, bash and GRUB installed. The scenario tests stand in for GRUB and the reboot, so a real kernel trial has not been run here.
-- **Not tested:** other Linux distributions, other shells and terminal programs, and any assistive technology (see the spot check above).
+- **Not tested:** other Linux distributions, other shells and terminal programs, and assistive technology other than Orca (see the spot check above).
 
 ## Known limitations
 
-- Two tables in the README have header cells with no text, so a screen reader has no column name for them. Tracked in [#1](https://github.com/Gooder24/reboot-when-idle/issues/1).
-- Nobody has yet listened to the tool's output with a screen reader.
+- `status` lists the work in login sessions on one long line, which is slow to follow by ear. Tracked in [#4](https://github.com/Gooder24/reboot-when-idle/issues/4).
+- The screen reader check was a transcript of Orca's speech, not a person listening: NVDA, VoiceOver and braille are not tested.
 - The automated check reads Markdown only. It does not check the tool's output, table header cells, link targets or code blocks. Tables and code blocks are reviewed by hand; link targets are not reviewed yet.
 
 ## Dependencies
