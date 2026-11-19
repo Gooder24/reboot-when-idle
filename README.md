@@ -119,14 +119,12 @@ Anything else: `reboot-when-idle hold make -j8 all`. The hold ends with the comm
 
 ## Commands
 
-```
-reboot-when-idle status                is a reboot due, what would hold it back now, what needs a look
-reboot-when-idle hold <command> [arg]  run a command; no automatic reboot while it runs
-reboot-when-idle hook prompt|tool|end  agent hooks
-reboot-when-idle run                   the nightly timer (root)
-reboot-when-idle boot early|check      at boot (root)
-reboot-when-idle --self-test
-```
+- `reboot-when-idle status`: is a reboot due, what would hold it back now, what needs a look.
+- `reboot-when-idle hold <command> [arg]`: run a command; no automatic reboot while it runs.
+- `reboot-when-idle hook prompt|tool|end`: agent hooks.
+- `reboot-when-idle run`: the nightly timer (root).
+- `reboot-when-idle boot early|check`: at boot (root).
+- `reboot-when-idle --self-test`: the self-test of `make check`.
 
 What happened at night: `journalctl -u reboot-when-idle -u reboot-when-idle-trial`.
 
