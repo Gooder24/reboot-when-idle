@@ -53,7 +53,7 @@ Accessibility is owned by **Gooder24**, the repository maintainer. The owner:
 
 ## Testing
 
-On every pull request, and on every push to `main`, [`.github/workflows/accessibility.yml`](.github/workflows/accessibility.yml) runs `check-docs.py` over the Markdown files. Known problems are listed in `.github/a11y-baseline.json`; a new problem fails the check.
+On every pull request and every push to `main` that changes a Markdown file or the check itself, [`.github/workflows/accessibility.yml`](.github/workflows/accessibility.yml) runs `check-docs.py` over the Markdown files. Known problems are listed in `.github/a11y-baseline.json`; a new problem fails the check.
 
 | Check | Status | Record (2026-11-16, Debian 13) |
 |---|---|---|
